@@ -14,8 +14,10 @@ async def check(url):
 
 
 async def main():
-    await check('http://127.0.0.1:5001/health')
-    await check('http://127.0.0.1:5002/health')
+    await check('http://127.0.0.1:8000/health')
+    await check('http://127.0.0.1:8000/api/data')
+    await check('http://127.0.0.1:8000/api/data')
+    await check('http://127.0.0.1:8000/api/data')
 
 
 if __name__ == '__main__':

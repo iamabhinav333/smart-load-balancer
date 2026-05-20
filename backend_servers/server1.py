@@ -10,7 +10,7 @@ app = FastAPI()
 
 
 @app.get("/")
-def read_root():
+async def read_root():
     return {
         "message": "Hello from Server 1",
         "server_id": 1,
@@ -19,7 +19,7 @@ def read_root():
 
 
 @app.get("/health")
-def health_check():
+async def health_check():
     return {
         "status": "healthy",
         "server": "Server 1"
@@ -27,11 +27,26 @@ def health_check():
 
 
 @app.get("/api/data")
-def get_data():
+async def get_data():
     return {
         "data": "Response from Server 1",
         "server_id": 1
     }
+
+
+@app.get("/search")
+async def search(q: str = ""):
+    return {"server": "Server 1", "path": "search", "q": q}
+
+
+@app.get("/profile")
+async def profile(id: int | None = None):
+    return {"server": "Server 1", "path": "profile", "id": id}
+
+
+@app.get("/feed")
+async def feed():
+    return {"server": "Server 1", "path": "feed", "items": [1, 2, 3]}
 
 
 if __name__ == "__main__":
