@@ -2,6 +2,8 @@
 Backend Server 2 - Running on port 5002
 """
 
+import asyncio
+
 from fastapi import FastAPI
 import uvicorn
 
@@ -27,7 +29,9 @@ async def health_check():
 
 
 @app.get("/api/data")
-async def get_data():
+async def get_data(delay: float = 0.0):
+    if delay > 0:
+        await asyncio.sleep(delay)
     return {
         "data": "Response from Server 2",
         "server_id": 2

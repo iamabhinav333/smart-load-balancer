@@ -1,5 +1,5 @@
 """
-Backend Server 1 - Running on port 5001
+Backend Server 3 - Running on port 5003
 """
 
 import asyncio
@@ -14,9 +14,9 @@ app = FastAPI()
 @app.get("/")
 async def read_root():
     return {
-        "message": "Hello from Server 1",
-        "server_id": 1,
-        "port": 5001
+        "message": "Hello from Server 3",
+        "server_id": 3,
+        "port": 5003,
     }
 
 
@@ -24,7 +24,7 @@ async def read_root():
 async def health_check():
     return {
         "status": "healthy",
-        "server": "Server 1"
+        "server": "Server 3",
     }
 
 
@@ -33,25 +33,25 @@ async def get_data(delay: float = 0.0):
     if delay > 0:
         await asyncio.sleep(delay)
     return {
-        "data": "Response from Server 1",
-        "server_id": 1
+        "data": "Response from Server 3",
+        "server_id": 3,
     }
 
 
 @app.get("/search")
 async def search(q: str = ""):
-    return {"server": "Server 1", "path": "search", "q": q}
+    return {"server": "Server 3", "path": "search", "q": q}
 
 
 @app.get("/profile")
 async def profile(id: int | None = None):
-    return {"server": "Server 1", "path": "profile", "id": id}
+    return {"server": "Server 3", "path": "profile", "id": id}
 
 
 @app.get("/feed")
 async def feed():
-    return {"server": "Server 1", "path": "feed", "items": [1, 2, 3]}
+    return {"server": "Server 3", "path": "feed", "items": ["x", "y", "z"]}
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=5001)
+    uvicorn.run(app, host="127.0.0.1", port=5003)
