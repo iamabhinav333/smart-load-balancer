@@ -5,14 +5,17 @@ import asyncio
 import logging
 import os
 import time
+from pathlib import Path
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 from starlette.responses import Response
 
 from balancer.schedulers.factory import available_scheduler_modes, create_scheduler
 from balancer.state import RoutingState
+from balancer.telemetry import RateLimiter, TelemetryState
 
 
 BACKENDS = [
@@ -29,12 +32,42 @@ BACKEND_WEIGHTS = {
 
 SCHEDULER_MODE = os.getenv("BALANCER_SCHEDULER", "least_connections")
 HEALTH_CHECK_INTERVAL = float(os.getenv("BALANCER_HEALTH_INTERVAL", "5.0"))
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("BALANCER_RATE_LIMIT_MAX_REQUESTS", "60"))
+RATE_LIMIT_WINDOW_SECONDS = float(os.getenv("BALANCER_RATE_LIMIT_WINDOW_SECONDS", "60.0"))
 
 logger = logging.getLogger("balancer")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 state = RoutingState(BACKENDS, BACKEND_WEIGHTS)
 scheduler = create_scheduler(SCHEDULER_MODE)
+rate_limiter = RateLimiter(RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
+telemetry = TelemetryState(BACKENDS)
+ROOT_DIR = Path(__file__).resolve().parents[1]
+DASHBOARD_FILE = ROOT_DIR / "dashboard" / "index.html"
+
+
+def get_client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    if request.client is not None and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def is_protected_route(path: str) -> bool:
+    exempt_prefixes = (
+        "/health",
+        "/stats",
+        "/scheduler",
+        "/metrics",
+        "/api/metrics",
+        "/dashboard",
+    )
+    return not path.startswith(exempt_prefixes)
 
 
 async def check_backend(session: aiohttp.ClientSession, backend: str, timeout_sec: float = 1.0) -> tuple[str, bool, str | None]:
@@ -74,6 +107,47 @@ async def monitor_loop(interval: float = HEALTH_CHECK_INTERVAL):
             await asyncio.sleep(interval)
 
 
+app = FastAPI(title="Smart Load Balancer")
+
+
+@app.middleware("http")
+async def rate_limit_and_telemetry_middleware(request: Request, call_next):
+    path = request.url.path
+    if not is_protected_route(path):
+        return await call_next(request)
+
+    client_ip = get_client_ip(request)
+    allowed, details = await rate_limiter.allow(client_ip, path)
+    if not allowed:
+        await telemetry.record_blocked_request(
+            client_ip,
+            path,
+            retry_after=int(details["retry_after"]),
+            limit=int(details["limit"]),
+        )
+        logger.warning(
+            "Rate limit exceeded for %s on %s (%s requests in %ss)",
+            client_ip,
+            path,
+            details["request_count"],
+            RATE_LIMIT_WINDOW_SECONDS,
+        )
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": "Too Many Requests",
+                "client_ip": client_ip,
+                "limit": details["limit"],
+                "window_seconds": RATE_LIMIT_WINDOW_SECONDS,
+                "retry_after": details["retry_after"],
+            },
+            headers={"Retry-After": str(details["retry_after"])},
+        )
+
+    await telemetry.record_allowed_request(client_ip, path)
+    return await call_next(request)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await state.initialize()
@@ -88,7 +162,7 @@ async def lifespan(app: FastAPI):
             logger.info("Monitor task cancelled")
 
 
-app = FastAPI(title="Smart Load Balancer", lifespan=lifespan)
+app.router.lifespan_context = lifespan
 
 
 @app.get("/")
@@ -98,6 +172,8 @@ async def root():
         "scheduler": scheduler.name,
         "available_schedulers": available_scheduler_modes(),
         "backends": BACKENDS,
+        "dashboard": "/dashboard",
+        "metrics": "/api/metrics",
     }
 
 
@@ -128,9 +204,28 @@ async def stats():
     }
 
 
+@app.get("/metrics")
+async def metrics():
+    return await telemetry.snapshot(state, rate_limiter)
+
+
+@app.get("/api/metrics")
+async def api_metrics():
+    return await telemetry.snapshot(state, rate_limiter)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    if not DASHBOARD_FILE.exists():
+        raise HTTPException(status_code=500, detail="Dashboard UI is missing")
+    return DASHBOARD_FILE.read_text(encoding="utf-8")
+
+
 async def proxy_to_backend(request: Request, path: str):
     backend = None
+    client_ip = get_client_ip(request)
     start = time.perf_counter()
+    upstream_status = 502
     try:
         backend = await scheduler.select_backend(state)
         await state.start_request(backend)
@@ -145,6 +240,7 @@ async def proxy_to_backend(request: Request, path: str):
             try:
                 body = await request.body()
                 async with session.request(request.method, forward_url, headers=forward_headers, data=body) as upstream:
+                    upstream_status = upstream.status
                     content = await upstream.read()
                     response_headers = {
                         key: value
@@ -166,11 +262,13 @@ async def proxy_to_backend(request: Request, path: str):
                     return Response(content=content, status_code=upstream.status, headers=response_headers, media_type=media_type)
             except aiohttp.ClientError as exc:
                 logger.warning("Proxy error for backend %s: %s", backend, exc)
+                upstream_status = 502
                 raise HTTPException(status_code=502, detail=str(exc))
     finally:
         if backend is not None:
             latency = time.perf_counter() - start
             await state.finish_request(backend, latency)
+            await telemetry.record_completion(client_ip, backend, path, latency, upstream_status)
 
 
 @app.get("/api/data")
@@ -180,7 +278,7 @@ async def api_data(request: Request):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy(path: str, request: Request):
-    if path in {"", "health", "stats", "scheduler"}:
+    if path in {"", "health", "stats", "scheduler", "dashboard", "metrics", "api/metrics"}:
         raise HTTPException(status_code=404, detail="Not found")
     return await proxy_to_backend(request, path)
 

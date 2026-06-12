@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smart Load Balancer Dashboard</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #081120;
+      --panel: rgba(10, 18, 33, 0.88);
+      --panel-strong: #101c33;
+      --border: rgba(148, 163, 184, 0.18);
+      --text: #e5eefb;
+      --muted: #91a4c2;
+      --accent: #63b3ff;
+      --accent-2: #73f7c3;
+      --danger: #ff7f7f;
+      --warning: #ffd166;
+      --shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "Trebuchet MS", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(99, 179, 255, 0.12), transparent 28%),
+        radial-gradient(circle at 85% 10%, rgba(115, 247, 195, 0.12), transparent 24%),
+        linear-gradient(180deg, #07101c 0%, #091326 45%, #060b13 100%);
+      color: var(--text);
+    }
+
+    .shell {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+
+    .hero {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 22px;
+      padding: 24px 26px;
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: linear-gradient(145deg, rgba(16, 28, 51, 0.96), rgba(8, 17, 32, 0.92));
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      font-size: 0.8rem;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--accent-2);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 3vw, 3.4rem);
+      line-height: 1.05;
+    }
+
+    .subtitle {
+      margin: 10px 0 0;
+      color: var(--muted);
+      max-width: 64ch;
+      line-height: 1.5;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(115, 247, 195, 0.12);
+      border: 1px solid rgba(115, 247, 195, 0.28);
+      color: #bcffe3;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .grid {
+      display: grid;
+      gap: 18px;
+    }
+
+    .cards {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      margin-bottom: 18px;
+    }
+
+    .card,
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .card {
+      padding: 18px;
+      min-height: 124px;
+    }
+
+    .card .label {
+      color: var(--muted);
+      font-size: 0.88rem;
+      margin-bottom: 12px;
+    }
+
+    .card .value {
+      font-size: clamp(1.8rem, 4vw, 2.8rem);
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+
+    .card .hint {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .main-grid {
+      grid-template-columns: 1.5fr 1fr;
+      align-items: start;
+    }
+
+    .panel {
+      padding: 18px;
+    }
+
+    .panel h2 {
+      margin: 0 0 8px;
+      font-size: 1.05rem;
+    }
+
+    .panel .description {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .chart-wrap {
+      display: grid;
+      gap: 16px;
+    }
+
+    canvas {
+      width: 100%;
+      height: 240px;
+      display: block;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(15, 24, 43, 0.9), rgba(7, 13, 24, 0.95));
+      border: 1px solid rgba(148, 163, 184, 0.14);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 16px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 12px 10px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+      font-size: 0.92rem;
+    }
+
+    th { color: var(--muted); font-weight: 600; }
+
+    .health-dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-right: 8px;
+      background: var(--danger);
+      box-shadow: 0 0 0 4px rgba(255, 127, 127, 0.08);
+    }
+
+    .healthy { color: #bcffe3; }
+    .healthy .health-dot { background: var(--accent-2); box-shadow: 0 0 0 4px rgba(115, 247, 195, 0.08); }
+    .unhealthy { color: #ffc8c8; }
+
+    .progress {
+      position: relative;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(148, 163, 184, 0.12);
+      overflow: hidden;
+      margin-top: 8px;
+    }
+
+    .progress > span {
+      position: absolute;
+      inset: 0 auto 0 0;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      border-radius: inherit;
+    }
+
+    .recent-list {
+      display: grid;
+      gap: 10px;
+      max-height: 420px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+
+    .section {
+      margin-top: 18px;
+    }
+
+    .mini-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+
+    .mini-table th,
+    .mini-table td {
+      padding: 10px 8px;
+      font-size: 0.86rem;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+    }
+
+    .mini-table th {
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .event {
+      padding: 12px 14px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+    }
+
+    .event .meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      color: var(--muted);
+      font-size: 0.85rem;
+      margin-bottom: 6px;
+    }
+
+    .event .title {
+      margin: 0;
+      font-weight: 600;
+    }
+
+    .event .detail {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    @media (max-width: 1080px) {
+      .cards, .main-grid { grid-template-columns: 1fr; }
+      .hero { flex-direction: column; align-items: start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Monitoring Dashboard</p>
+        <h1>Smart Load Balancer</h1>
+        <p class="subtitle">Live request flow, backend health, response latency, and client rate-limiting activity are updated in real time from the balancer metrics API.</p>
+      </div>
+      <div class="status-pill" id="liveStatus">Live update: connecting</div>
+    </section>
+
+    <section class="grid cards">
+      <div class="card"><div class="label">Requests / sec</div><div class="value" id="requestsPerSecond">0.00</div><div class="hint">Rolling 60-second window</div></div>
+      <div class="card"><div class="label">Average latency</div><div class="value" id="avgLatency">0 ms</div><div class="hint">Across completed requests</div></div>
+      <div class="card"><div class="label">Failed requests</div><div class="value" id="failedRequests">0</div><div class="hint">Proxy or upstream errors</div></div>
+      <div class="card"><div class="label">Blocked requests</div><div class="value" id="blockedRequests">0</div><div class="hint">Rate-limited client traffic</div></div>
+    </section>
+
+    <section class="grid main-grid">
+      <div class="panel chart-wrap">
+        <div>
+          <h2>Traffic Distribution</h2>
+          <p class="description">Request share and backend health for each server.</p>
+          <table>
+            <thead>
+              <tr>
+                <th>Backend</th>
+                <th>Status</th>
+                <th>Requests</th>
+                <th>Latency</th>
+                <th>Share</th>
+              </tr>
+            </thead>
+            <tbody id="backendRows"></tbody>
+          </table>
+        </div>
+
+        <div>
+          <h2>Requests / sec</h2>
+          <p class="description">Recent request volume by time bucket.</p>
+          <canvas id="requestsChart" width="1200" height="300"></canvas>
+        </div>
+
+        <div>
+          <h2>Latency Graph</h2>
+          <p class="description">Average response time per bucket in milliseconds.</p>
+          <canvas id="latencyChart" width="1200" height="300"></canvas>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Live Activity</h2>
+        <p class="description">Recent requests, rate-limit blocks, and backend responses.</p>
+        <div class="recent-list" id="recentEvents"></div>
+
+        <div class="section">
+          <h2>Rate Limiting</h2>
+          <p class="description">Top client request counts and recent suspicious traffic patterns.</p>
+          <table class="mini-table">
+            <thead>
+              <tr>
+                <th>Client IP</th>
+                <th>Requests</th>
+                <th>Blocked</th>
+                <th>Active Window</th>
+              </tr>
+            </thead>
+            <tbody id="rateLimitRows"></tbody>
+          </table>
+          <div class="recent-list" id="suspiciousEvents" style="margin-top: 12px;"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const metricsUrl = "/api/metrics";
+    const liveStatus = document.getElementById("liveStatus");
+    const requestsPerSecond = document.getElementById("requestsPerSecond");
+    const avgLatency = document.getElementById("avgLatency");
+    const failedRequests = document.getElementById("failedRequests");
+    const blockedRequests = document.getElementById("blockedRequests");
+    const backendRows = document.getElementById("backendRows");
+    const recentEvents = document.getElementById("recentEvents");
+    const rateLimitRows = document.getElementById("rateLimitRows");
+    const suspiciousEvents = document.getElementById("suspiciousEvents");
+
+    function fmtTime(ts) {
+      if (!ts) return "n/a";
+      return new Date(ts * 1000).toLocaleTimeString();
+    }
+
+    function fmtLatency(ms) {
+      return `${Number(ms || 0).toFixed(1)} ms`;
+    }
+
+    function drawChart(canvas, labels, values, color, fillColor, title) {
+      const ctx = canvas.getContext("2d");
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.scale(dpr, dpr);
+
+      const width = rect.width;
+      const height = rect.height;
+      ctx.clearRect(0, 0, width, height);
+
+      ctx.fillStyle = "rgba(255,255,255,0.04)";
+      ctx.fillRect(0, 0, width, height);
+
+      const padding = 34;
+      const maxValue = Math.max(1, ...values);
+      const stepX = values.length > 1 ? (width - padding * 2) / (values.length - 1) : 0;
+
+      ctx.strokeStyle = "rgba(148,163,184,0.18)";
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = padding + (height - padding * 2) * (i / 4);
+        ctx.beginPath();
+        ctx.moveTo(padding, y);
+        ctx.lineTo(width - padding, y);
+        ctx.stroke();
+      }
+
+      if (values.length === 0) {
+        ctx.fillStyle = "#91a4c2";
+        ctx.font = "14px Segoe UI";
+        ctx.fillText("Waiting for live data...", padding, height / 2);
+        return;
+      }
+
+      ctx.beginPath();
+      values.forEach((value, index) => {
+        const x = padding + stepX * index;
+        const y = height - padding - ((height - padding * 2) * (value / maxValue));
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      ctx.lineTo(width - padding, height - padding);
+      ctx.lineTo(padding, height - padding);
+      ctx.closePath();
+      const gradient = ctx.createLinearGradient(0, 0, 0, height);
+      gradient.addColorStop(0, fillColor);
+      gradient.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = gradient;
+      ctx.fill();
+
+      ctx.fillStyle = "#91a4c2";
+      ctx.font = "12px Segoe UI";
+      labels.forEach((label, index) => {
+        if (index % Math.ceil(labels.length / 4) !== 0 && index !== labels.length - 1) return;
+        const x = padding + stepX * index;
+        ctx.fillText(label, x - 10, height - 10);
+      });
+
+      ctx.fillStyle = "#e5eefb";
+      ctx.font = "bold 14px Segoe UI";
+      ctx.fillText(title, padding, 18);
+    }
+
+    function backendStatusRow(backend) {
+      const healthy = backend.healthy ? "healthy" : "unhealthy";
+      return `
+        <tr>
+          <td>${backend.backend}</td>
+          <td class="${healthy}"><span class="health-dot"></span>${backend.healthy ? "Healthy" : "Unhealthy"}</td>
+          <td>${backend.request_count}</td>
+          <td>${fmtLatency(backend.average_latency_ms)}</td>
+          <td>
+            ${backend.share.toFixed(1)}%
+            <div class="progress"><span style="width:${Math.min(100, backend.share)}%"></span></div>
+          </td>
+        </tr>
+      `;
+    }
+
+    function eventCard(event) {
+      const ts = fmtTime(event.timestamp);
+      if (event.type === "blocked") {
+        return `
+          <div class="event">
+            <div class="meta"><span>Blocked</span><span>${ts}</span></div>
+            <p class="title">${event.client_ip} rate-limited</p>
+            <p class="detail">${event.path} exceeded ${event.limit} requests per window. Retry after ${event.retry_after}s.</p>
+          </div>
+        `;
+      }
+      return `
+        <div class="event">
+          <div class="meta"><span>${event.type === "allowed" ? "Allowed" : "Request"}</span><span>${ts}</span></div>
+          <p class="title">${event.client_ip} ${event.path}</p>
+          <p class="detail">Request entered the balancer path.</p>
+        </div>
+      `;
+    }
+
+    function completionCard(event) {
+      const status = event.failed ? "Failed" : "Completed";
+      const label = event.failed ? "var(--danger)" : "var(--accent-2)";
+      return `
+        <div class="event">
+          <div class="meta"><span style="color:${label}">${status}</span><span>${fmtTime(event.timestamp)}</span></div>
+          <p class="title">${event.backend} handled ${event.path}</p>
+          <p class="detail">Status ${event.status_code} · ${fmtLatency(event.latency_ms)}</p>
+        </div>
+      `;
+    }
+
+    function rateLimitRow(client) {
+      return `
+        <tr>
+          <td>${client.client_ip}</td>
+          <td>${client.request_count}</td>
+          <td>${client.blocked_count}</td>
+          <td>${client.active_window_count}</td>
+        </tr>
+      `;
+    }
+
+    function suspiciousCard(event) {
+      return `
+        <div class="event">
+          <div class="meta"><span>Suspicious</span><span>${fmtTime(event.timestamp)}</span></div>
+          <p class="title">${event.client_ip} ${event.type}</p>
+          <p class="detail">${event.path} · ${event.request_count}/${event.limit} in window</p>
+        </div>
+      `;
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch(metricsUrl, { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        liveStatus.textContent = `Live update: ${new Date(data.generated_at * 1000).toLocaleTimeString()}`;
+        requestsPerSecond.textContent = Number(data.summary.requests_per_second || 0).toFixed(2);
+        avgLatency.textContent = `${Number(data.summary.average_latency_ms || 0).toFixed(1)} ms`;
+        failedRequests.textContent = data.summary.failed_requests ?? 0;
+        blockedRequests.textContent = data.summary.blocked_requests ?? 0;
+
+        backendRows.innerHTML = (data.backends || []).map(backendStatusRow).join("");
+        recentEvents.innerHTML = [
+          ...(data.recent_requests || []).slice(-10).reverse().map(eventCard),
+          ...(data.recent_completions || []).slice(-10).reverse().map(completionCard),
+        ].join("");
+        rateLimitRows.innerHTML = (data.rate_limit?.clients || []).slice(0, 8).map(rateLimitRow).join("");
+        suspiciousEvents.innerHTML = (data.rate_limit?.recent_suspicious_events || []).slice(-10).reverse().map(suspiciousCard).join("");
+
+        const labels = data.timeseries?.labels || [];
+        drawChart(
+          document.getElementById("requestsChart"),
+          labels,
+          data.timeseries?.requests_per_bucket || [],
+          "#63b3ff",
+          "rgba(99,179,255,0.28)",
+          "Requests / sec"
+        );
+        drawChart(
+          document.getElementById("latencyChart"),
+          labels,
+          data.timeseries?.latency_ms_per_bucket || [],
+          "#73f7c3",
+          "rgba(115,247,195,0.24)",
+          "Latency (ms)"
+        );
+      } catch (error) {
+        liveStatus.textContent = `Live update failed: ${error.message}`;
+      }
+    }
+
+    window.addEventListener("resize", refresh);
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
