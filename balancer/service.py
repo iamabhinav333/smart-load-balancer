@@ -42,6 +42,48 @@ state = RoutingState(BACKENDS, BACKEND_WEIGHTS)
 scheduler = create_scheduler(SCHEDULER_MODE)
 rate_limiter = RateLimiter(RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
 telemetry = TelemetryState(BACKENDS)
+# Simple in-memory GET response cache
+class SimpleCacheEntry:
+    def __init__(self, content: bytes, headers: dict[str, str], media_type: str | None, expires_at: float):
+        self.content = content
+        self.headers = headers
+        self.media_type = media_type
+        self.expires_at = expires_at
+
+
+class SimpleInMemoryCache:
+    def __init__(self, ttl_seconds: float = 5.0):
+        self._store: dict[str, SimpleCacheEntry] = {}
+        self._ttl = float(ttl_seconds)
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> SimpleCacheEntry | None:
+        now = time.time()
+        async with self._lock:
+            entry = self._store.get(key)
+            if not entry:
+                return None
+            if entry.expires_at < now:
+                # expired
+                self._store.pop(key, None)
+                await telemetry.record_cache_evict()
+                return None
+            return entry
+
+    async def set(self, key: str, content: bytes, headers: dict[str, str], media_type: str | None, ttl: float | None = None):
+        expires_at = time.time() + (ttl if ttl is not None else self._ttl)
+        async with self._lock:
+            self._store[key] = SimpleCacheEntry(content, headers, media_type, expires_at)
+        await telemetry.record_cache_store(ttl)
+
+    async def snapshot(self) -> dict:
+        now = time.time()
+        async with self._lock:
+            return {"entries": len(self._store), "ttl_seconds": self._ttl}
+
+
+cache_ttl = float(os.getenv("BALANCER_CACHE_TTL_SECONDS", "5.0"))
+cache = SimpleInMemoryCache(cache_ttl)
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DASHBOARD_FILE = ROOT_DIR / "dashboard" / "index.html"
 
@@ -226,7 +268,18 @@ async def proxy_to_backend(request: Request, path: str):
     client_ip = get_client_ip(request)
     start = time.perf_counter()
     upstream_status = 502
+    cache_key = None
     try:
+        # Only cache GET responses for idempotent fetches
+        if request.method.upper() == "GET":
+            cache_key = request.url.path + ("?" + request.url.query if request.url.query else "")
+            entry = await cache.get(cache_key)
+            if entry is not None:
+                await telemetry.record_cache_hit(client_ip, path)
+                # Return cached response
+                return Response(content=entry.content, status_code=200, headers=entry.headers, media_type=entry.media_type)
+            else:
+                await telemetry.record_cache_miss(client_ip, path)
         backend = await scheduler.select_backend(state)
         await state.start_request(backend)
 
@@ -259,6 +312,12 @@ async def proxy_to_backend(request: Request, path: str):
                         }
                     }
                     media_type = response_headers.get("Content-Type")
+                        # Store GET responses in cache when status is 200
+                        if request.method.upper() == "GET" and upstream.status == 200:
+                            try:
+                                await cache.set(cache_key, content, response_headers, media_type, ttl=cache_ttl)
+                            except Exception:
+                                logger.exception("Failed to store cache entry")
                     return Response(content=content, status_code=upstream.status, headers=response_headers, media_type=media_type)
             except aiohttp.ClientError as exc:
                 logger.warning("Proxy error for backend %s: %s", backend, exc)

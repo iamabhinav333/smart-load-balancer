@@ -287,6 +287,13 @@
       <div class="card"><div class="label">Blocked requests</div><div class="value" id="blockedRequests">0</div><div class="hint">Rate-limited client traffic</div></div>
     </section>
 
+    <section class="grid cards">
+      <div class="card"><div class="label">Cache hits</div><div class="value" id="cacheHits">0</div><div class="hint">Responses served from balancer cache</div></div>
+      <div class="card"><div class="label">Cache misses</div><div class="value" id="cacheMisses">0</div><div class="hint">Requests forwarded to backends</div></div>
+      <div class="card"><div class="label">Cache entries</div><div class="value" id="cacheEntries">0</div><div class="hint">Current entries in cache</div></div>
+      <div class="card"><div class="label">Cache TTL</div><div class="value" id="cacheTTL">0s</div><div class="hint">Default cache expiry</div></div>
+    </section>
+
     <section class="grid main-grid">
       <div class="panel chart-wrap">
         <div>
@@ -351,6 +358,10 @@
     const avgLatency = document.getElementById("avgLatency");
     const failedRequests = document.getElementById("failedRequests");
     const blockedRequests = document.getElementById("blockedRequests");
+    const cacheHits = document.getElementById("cacheHits");
+    const cacheMisses = document.getElementById("cacheMisses");
+    const cacheEntries = document.getElementById("cacheEntries");
+    const cacheTTL = document.getElementById("cacheTTL");
     const backendRows = document.getElementById("backendRows");
     const recentEvents = document.getElementById("recentEvents");
     const rateLimitRows = document.getElementById("rateLimitRows");
@@ -514,6 +525,10 @@
         avgLatency.textContent = `${Number(data.summary.average_latency_ms || 0).toFixed(1)} ms`;
         failedRequests.textContent = data.summary.failed_requests ?? 0;
         blockedRequests.textContent = data.summary.blocked_requests ?? 0;
+        cacheHits.textContent = data.cache?.hits ?? 0;
+        cacheMisses.textContent = data.cache?.misses ?? 0;
+        cacheEntries.textContent = data.cache?.entries ?? 0;
+        cacheTTL.textContent = (data.cache?.ttl_seconds ?? 0) + "s";
 
         backendRows.innerHTML = (data.backends || []).map(backendStatusRow).join("");
         recentEvents.innerHTML = [

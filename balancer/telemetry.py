@@ -79,6 +79,10 @@ class TelemetryState:
         self.total_requests = 0
         self.allowed_requests = 0
         self.blocked_requests = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.cache_entries = 0
+        self.cache_ttl_seconds: float | None = None
         self.failed_requests = 0
         self.total_latency = 0.0
         self.completed_requests = 0
@@ -115,6 +119,44 @@ class TelemetryState:
                     "limit": limit,
                 }
             )
+
+    async def record_cache_hit(self, client_ip: str, path: str) -> None:
+        now = time.time()
+        async with self._lock:
+            self.cache_hits += 1
+            self._request_events.append(
+                {
+                    "timestamp": now,
+                    "type": "cache_hit",
+                    "client_ip": client_ip,
+                    "path": path,
+                }
+            )
+
+    async def record_cache_miss(self, client_ip: str, path: str) -> None:
+        now = time.time()
+        async with self._lock:
+            self.cache_misses += 1
+            self._request_events.append(
+                {
+                    "timestamp": now,
+                    "type": "cache_miss",
+                    "client_ip": client_ip,
+                    "path": path,
+                }
+            )
+
+    async def record_cache_store(self, ttl_seconds: float | None = None) -> None:
+        now = time.time()
+        async with self._lock:
+            self.cache_entries += 1
+            if ttl_seconds is not None:
+                self.cache_ttl_seconds = float(ttl_seconds)
+
+    async def record_cache_evict(self) -> None:
+        async with self._lock:
+            if self.cache_entries > 0:
+                self.cache_entries -= 1
 
     async def record_completion(
         self,
@@ -222,6 +264,13 @@ class TelemetryState:
             "recent_suspicious_events": [],
         }
 
+        cache_snapshot = {
+            "hits": self.cache_hits,
+            "misses": self.cache_misses,
+            "entries": self.cache_entries,
+            "ttl_seconds": self.cache_ttl_seconds or 0.0,
+        }
+
         return {
             "generated_at": now,
             "summary": {
@@ -239,6 +288,7 @@ class TelemetryState:
             "health": health_snapshot,
             "stats": stats_snapshot,
             "rate_limit": rate_limit_snapshot,
+            "cache": cache_snapshot,
             "timeseries": timeseries,
             "recent_requests": recent_events,
             "recent_completions": recent_completions,
