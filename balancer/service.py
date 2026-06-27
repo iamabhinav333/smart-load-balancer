@@ -312,12 +312,12 @@ async def proxy_to_backend(request: Request, path: str):
                         }
                     }
                     media_type = response_headers.get("Content-Type")
-                        # Store GET responses in cache when status is 200
-                        if request.method.upper() == "GET" and upstream.status == 200:
-                            try:
-                                await cache.set(cache_key, content, response_headers, media_type, ttl=cache_ttl)
-                            except Exception:
-                                logger.exception("Failed to store cache entry")
+                    # Store GET responses in cache when status is 200
+                    if request.method.upper() == "GET" and upstream.status == 200 and cache_key is not None:
+                        try:
+                            await cache.set(cache_key, content, response_headers, media_type, ttl=cache_ttl)
+                        except Exception:
+                            logger.exception("Failed to store cache entry")
                     return Response(content=content, status_code=upstream.status, headers=response_headers, media_type=media_type)
             except aiohttp.ClientError as exc:
                 logger.warning("Proxy error for backend %s: %s", backend, exc)
