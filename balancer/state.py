@@ -54,6 +54,27 @@ class RoutingState:
                     weight=self.weights[backend],
                 )
 
+    async def add_backend(self, backend: str, weight: int = 1) -> None:
+        async with self.lock:
+            if backend in self.backends:
+                self.weights[backend] = max(1, int(weight))
+                self.stats[backend].weight = self.weights[backend]
+                return
+            self.backends.append(backend)
+            self.weights[backend] = max(1, int(weight))
+            self.stats[backend] = BackendStats(healthy=False, weight=self.weights[backend])
+            if backend not in self.active_backends:
+                self.active_backends.append(backend)
+
+    async def remove_backend(self, backend: str) -> None:
+        async with self.lock:
+            if backend in self.backends:
+                self.backends = [item for item in self.backends if item != backend]
+            if backend in self.active_backends:
+                self.active_backends = [item for item in self.active_backends if item != backend]
+            self.weights.pop(backend, None)
+            self.stats.pop(backend, None)
+
     async def record_health(self, backend: str, healthy: bool, error: str | None = None) -> tuple[bool, bool]:
         async with self.lock:
             now = time.time()

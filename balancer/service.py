@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 
 import aiohttp
@@ -12,7 +13,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 from starlette.responses import Response
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from balancer.autoscaling import LocalAutoscaler
+from balancer.distributed import SharedStateStore
 from balancer.ha import SharedClusterState, build_local_ha_payload
 from balancer.schedulers.factory import available_scheduler_modes, create_scheduler
 from balancer.state import RoutingState
@@ -47,6 +51,18 @@ BALANCER_PEER_URLS = [
     for url in os.getenv("BALANCER_PEER_URLS", "").split(",")
     if url.strip()
 ]
+BALANCER_SESSION_COOKIE = os.getenv("BALANCER_SESSION_COOKIE", "slb_session")
+BALANCER_STATE_NAMESPACE = os.getenv("BALANCER_STATE_NAMESPACE", "distributed_state")
+BALANCER_SESSION_TTL_SECONDS = float(os.getenv("BALANCER_SESSION_TTL_SECONDS", "1800.0"))
+BALANCER_DISCOVERY_INTERVAL_SECONDS = float(os.getenv("BALANCER_DISCOVERY_INTERVAL_SECONDS", "5.0"))
+BALANCER_AUTOSCALER_ENABLED = os.getenv("BALANCER_AUTOSCALER_ENABLED", "1") != "0"
+BALANCER_AUTOSCALER_MIN_REPLICAS = int(os.getenv("BALANCER_AUTOSCALER_MIN_REPLICAS", "0"))
+BALANCER_AUTOSCALER_MAX_REPLICAS = int(os.getenv("BALANCER_AUTOSCALER_MAX_REPLICAS", "3"))
+BALANCER_AUTOSCALER_START_PORT = int(os.getenv("BALANCER_AUTOSCALER_START_PORT", "5100"))
+BALANCER_AUTOSCALER_SCALE_UP_RPS = float(os.getenv("BALANCER_AUTOSCALER_SCALE_UP_RPS", "8.0"))
+BALANCER_AUTOSCALER_SCALE_UP_CONNECTIONS = int(os.getenv("BALANCER_AUTOSCALER_SCALE_UP_CONNECTIONS", "6"))
+BALANCER_AUTOSCALER_COOLDOWN_SECONDS = float(os.getenv("BALANCER_AUTOSCALER_COOLDOWN_SECONDS", "20.0"))
+BALANCER_AUTOSCALER_IDLE_SECONDS = float(os.getenv("BALANCER_AUTOSCALER_IDLE_SECONDS", "120.0"))
 
 logger = logging.getLogger("balancer")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -56,6 +72,17 @@ scheduler = create_scheduler(SCHEDULER_MODE)
 rate_limiter = RateLimiter(RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
 telemetry = TelemetryState(BACKENDS)
 cluster_state = SharedClusterState(BALANCER_SHARED_STATE_DIR, BALANCER_HA_HEARTBEAT_TIMEOUT_SECONDS)
+shared_state = SharedStateStore(BALANCER_SHARED_STATE_DIR, namespace=BALANCER_STATE_NAMESPACE)
+autoscaler = LocalAutoscaler(
+    shared_state,
+    start_port=BALANCER_AUTOSCALER_START_PORT,
+    max_replicas=BALANCER_AUTOSCALER_MAX_REPLICAS,
+    min_replicas=BALANCER_AUTOSCALER_MIN_REPLICAS,
+    scale_up_requests_per_second=BALANCER_AUTOSCALER_SCALE_UP_RPS,
+    scale_up_active_connections=BALANCER_AUTOSCALER_SCALE_UP_CONNECTIONS,
+    scale_down_idle_seconds=BALANCER_AUTOSCALER_IDLE_SECONDS,
+    cooldown_seconds=BALANCER_AUTOSCALER_COOLDOWN_SECONDS,
+) if BALANCER_AUTOSCALER_ENABLED else None
 peer_heartbeats: dict[str, dict[str, object]] = {}
 peer_heartbeat_lock = asyncio.Lock()
 # Simple in-memory GET response cache
@@ -165,6 +192,39 @@ async def monitor_loop(interval: float = HEALTH_CHECK_INTERVAL):
             await asyncio.sleep(interval)
 
 
+async def discovery_loop(interval: float = BALANCER_DISCOVERY_INTERVAL_SECONDS):
+    logger.info("Starting discovery loop (interval=%ss)", interval)
+    while True:
+        try:
+            discovered_backends = await shared_state.list_backends()
+            discovered_urls = []
+            for backend in discovered_backends:
+                backend_url = str(backend.get("backend_url", "")).strip().rstrip("/")
+                if not backend_url:
+                    continue
+                discovered_urls.append(backend_url)
+                weight = int(backend.get("weight", 1) or 1)
+                await state.add_backend(backend_url, weight=weight)
+                if bool(backend.get("healthy", True)):
+                    await state.record_health(backend_url, True, None)
+
+            for backend_url in list(state.backends):
+                if backend_url not in discovered_urls and backend_url not in BACKENDS:
+                    await state.remove_backend(backend_url)
+
+            if autoscaler is not None:
+                metrics = await telemetry.snapshot(state, rate_limiter)
+                summary = metrics.get("summary", {})
+                await autoscaler.maybe_scale(
+                    requests_per_second=float(summary.get("requests_per_second", 0.0)),
+                    active_connections=sum(view.active_connections for view in await state.active_views()),
+                    active_backends=len(await state.active_views()),
+                )
+        except Exception:
+            logger.exception("Discovery loop failed")
+        await asyncio.sleep(interval)
+
+
 async def publish_cluster_state_loop(interval: float = BALANCER_HA_PUBLISH_INTERVAL_SECONDS):
     logger.info("Starting cluster state publish loop (interval=%ss)", interval)
     while True:
@@ -266,12 +326,14 @@ async def rate_limit_and_telemetry_middleware(request: Request, call_next):
 async def lifespan(app: FastAPI):
     await state.initialize()
     monitor_task = asyncio.create_task(monitor_loop())
+    discovery_task = asyncio.create_task(discovery_loop())
     publish_task = asyncio.create_task(publish_cluster_state_loop())
     peer_task = asyncio.create_task(monitor_peer_heartbeats()) if BALANCER_PEER_URLS else None
     try:
         yield
     finally:
         monitor_task.cancel()
+        discovery_task.cancel()
         publish_task.cancel()
         if peer_task is not None:
             peer_task.cancel()
@@ -279,6 +341,10 @@ async def lifespan(app: FastAPI):
             await monitor_task
         except asyncio.CancelledError:
             logger.info("Monitor task cancelled")
+        try:
+            await discovery_task
+        except asyncio.CancelledError:
+            logger.info("Discovery task cancelled")
         try:
             await publish_task
         except asyncio.CancelledError:
@@ -339,7 +405,11 @@ async def metrics():
 
 @app.get("/api/metrics")
 async def api_metrics():
-    return await telemetry.snapshot(state, rate_limiter)
+    metrics = await telemetry.snapshot(state, rate_limiter)
+    if autoscaler is not None:
+        metrics["autoscaling"] = await autoscaler.snapshot()
+    metrics["discovery"] = await shared_state.snapshot()
+    return metrics
 
 
 @app.get("/ha/heartbeat")
@@ -367,11 +437,102 @@ async def ha_status():
     }
 
 
+@app.get("/api/sessions")
+async def api_sessions():
+    return await shared_state.snapshot()
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     if not DASHBOARD_FILE.exists():
         raise HTTPException(status_code=500, detail="Dashboard UI is missing")
     return DASHBOARD_FILE.read_text(encoding="utf-8")
+
+
+def _session_id_from_headers_and_cookies(headers, cookies) -> tuple[str | None, bool]:
+    cookie_session = cookies.get(BALANCER_SESSION_COOKIE) if cookies is not None else None
+    if cookie_session:
+        return cookie_session.strip(), False
+    header_session = headers.get("x-session-id") if headers is not None else None
+    if header_session:
+        return header_session.strip(), False
+    return f"{BALANCER_INSTANCE_ID}-{uuid.uuid4().hex}", True
+
+
+async def _resolve_sticky_backend(request: Request, candidate_backends: list[str]) -> str | None:
+    session_id, _ = _session_id_from_headers_and_cookies(request.headers, request.cookies)
+    if session_id:
+        bound_backend = await shared_state.resolve_session(session_id)
+        if bound_backend and bound_backend in candidate_backends:
+            return bound_backend
+
+    if not candidate_backends:
+        return None
+
+    chosen_backend = await scheduler.select_backend(state)
+    if session_id:
+        await shared_state.bind_session(session_id, chosen_backend, ttl_seconds=BALANCER_SESSION_TTL_SECONDS)
+    return chosen_backend
+
+
+async def proxy_websocket_to_backend(client_socket: WebSocket, path: str):
+    backend = None
+    upstream_socket = None
+    upstream_session = None
+    try:
+        candidate_backends = [view.backend for view in await state.active_views()]
+        session_id, _ = _session_id_from_headers_and_cookies(client_socket.headers, client_socket.cookies)
+        if session_id:
+            bound_backend = await shared_state.resolve_session(session_id)
+            if bound_backend and bound_backend in candidate_backends:
+                backend = bound_backend
+        if backend is None and candidate_backends:
+            backend = await scheduler.select_backend(state)
+            if session_id:
+                await shared_state.bind_session(session_id, backend, ttl_seconds=BALANCER_SESSION_TTL_SECONDS)
+        if backend is None:
+            await client_socket.close(code=1013)
+            return
+
+        await client_socket.accept()
+        upstream_url = backend.replace("http://", "ws://").replace("https://", "wss://") + f"/{path}"
+        upstream_session = aiohttp.ClientSession()
+        upstream_socket = await upstream_session.ws_connect(upstream_url)
+
+        async def relay_client_to_backend():
+            while True:
+                message = await client_socket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                text = message.get("text")
+                if text is not None:
+                    await upstream_socket.send_str(text)
+
+        async def relay_backend_to_client():
+            async for message in upstream_socket:
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    await client_socket.send_text(message.data)
+                elif message.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                    break
+
+        await asyncio.gather(relay_client_to_backend(), relay_backend_to_client())
+    except WebSocketDisconnect:
+        return
+    finally:
+        if upstream_socket is not None:
+            await upstream_socket.close()
+        if upstream_session is not None:
+            await upstream_session.close()
+
+
+@app.websocket("/ws")
+async def websocket_root(websocket: WebSocket):
+    await proxy_websocket_to_backend(websocket, "ws")
+
+
+@app.websocket("/ws/{path:path}")
+async def websocket_proxy(path: str, websocket: WebSocket):
+    await proxy_websocket_to_backend(websocket, path)
 
 
 async def proxy_to_backend(request: Request, path: str):
@@ -380,6 +541,7 @@ async def proxy_to_backend(request: Request, path: str):
     start = time.perf_counter()
     upstream_status = 502
     cache_key = None
+    session_id, session_created = _session_id_from_headers_and_cookies(request.headers, request.cookies)
     try:
         # Only cache GET responses for idempotent fetches
         if request.method.upper() == "GET":
@@ -388,10 +550,14 @@ async def proxy_to_backend(request: Request, path: str):
             if entry is not None:
                 await telemetry.record_cache_hit(client_ip, path)
                 # Return cached response
-                return Response(content=entry.content, status_code=200, headers=entry.headers, media_type=entry.media_type)
+                cached_headers = dict(entry.headers)
+                if session_id and (session_created or BALANCER_SESSION_COOKIE not in request.cookies):
+                    cached_headers.setdefault("Set-Cookie", f"{BALANCER_SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax")
+                return Response(content=entry.content, status_code=200, headers=cached_headers, media_type=entry.media_type)
             else:
                 await telemetry.record_cache_miss(client_ip, path)
-        backend = await scheduler.select_backend(state)
+        candidate_backends = [view.backend for view in await state.active_views()]
+        backend = await _resolve_sticky_backend(request, candidate_backends)
         await state.start_request(backend)
 
         forward_url = backend.rstrip("/") + "/" + path
@@ -423,6 +589,8 @@ async def proxy_to_backend(request: Request, path: str):
                         }
                     }
                     media_type = response_headers.get("Content-Type")
+                    if session_id and (session_created or BALANCER_SESSION_COOKIE not in request.cookies):
+                        response_headers.setdefault("Set-Cookie", f"{BALANCER_SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax")
                     # Store GET responses in cache when status is 200
                     if request.method.upper() == "GET" and upstream.status == 200 and cache_key is not None:
                         try:
