@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 from starlette.responses import Response
 
+from balancer.ha import SharedClusterState, build_local_ha_payload
 from balancer.schedulers.factory import available_scheduler_modes, create_scheduler
 from balancer.state import RoutingState
 from balancer.telemetry import RateLimiter, TelemetryState
@@ -34,6 +35,18 @@ SCHEDULER_MODE = os.getenv("BALANCER_SCHEDULER", "least_connections")
 HEALTH_CHECK_INTERVAL = float(os.getenv("BALANCER_HEALTH_INTERVAL", "5.0"))
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("BALANCER_RATE_LIMIT_MAX_REQUESTS", "60"))
 RATE_LIMIT_WINDOW_SECONDS = float(os.getenv("BALANCER_RATE_LIMIT_WINDOW_SECONDS", "60.0"))
+BALANCER_HOST = os.getenv("BALANCER_HOST", "127.0.0.1")
+BALANCER_PORT = int(os.getenv("BALANCER_PORT", "8000"))
+BALANCER_INSTANCE_ID = os.getenv("BALANCER_INSTANCE_ID", f"lb-{os.getpid()}")
+BALANCER_PRIORITY = int(os.getenv("BALANCER_PRIORITY", "1"))
+BALANCER_SHARED_STATE_DIR = os.getenv("BALANCER_SHARED_STATE_DIR", str(Path(__file__).resolve().parents[1] / "ha_state"))
+BALANCER_HA_HEARTBEAT_TIMEOUT_SECONDS = float(os.getenv("BALANCER_HA_HEARTBEAT_TIMEOUT_SECONDS", "10.0"))
+BALANCER_HA_PUBLISH_INTERVAL_SECONDS = float(os.getenv("BALANCER_HA_PUBLISH_INTERVAL_SECONDS", "2.0"))
+BALANCER_PEER_URLS = [
+    url.strip().rstrip("/")
+    for url in os.getenv("BALANCER_PEER_URLS", "").split(",")
+    if url.strip()
+]
 
 logger = logging.getLogger("balancer")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -42,6 +55,9 @@ state = RoutingState(BACKENDS, BACKEND_WEIGHTS)
 scheduler = create_scheduler(SCHEDULER_MODE)
 rate_limiter = RateLimiter(RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
 telemetry = TelemetryState(BACKENDS)
+cluster_state = SharedClusterState(BALANCER_SHARED_STATE_DIR, BALANCER_HA_HEARTBEAT_TIMEOUT_SECONDS)
+peer_heartbeats: dict[str, dict[str, object]] = {}
+peer_heartbeat_lock = asyncio.Lock()
 # Simple in-memory GET response cache
 class SimpleCacheEntry:
     def __init__(self, content: bytes, headers: dict[str, str], media_type: str | None, expires_at: float):
@@ -149,6 +165,62 @@ async def monitor_loop(interval: float = HEALTH_CHECK_INTERVAL):
             await asyncio.sleep(interval)
 
 
+async def publish_cluster_state_loop(interval: float = BALANCER_HA_PUBLISH_INTERVAL_SECONDS):
+    logger.info("Starting cluster state publish loop (interval=%ss)", interval)
+    while True:
+        try:
+            telemetry_snapshot = await telemetry.snapshot(state, rate_limiter)
+            async with peer_heartbeat_lock:
+                heartbeat_snapshot = dict(peer_heartbeats)
+            payload = build_local_ha_payload(
+                instance_id=BALANCER_INSTANCE_ID,
+                instance_url=f"http://{BALANCER_HOST}:{BALANCER_PORT}",
+                priority=BALANCER_PRIORITY,
+                health_snapshot=telemetry_snapshot.get("health", {}),
+                stats_snapshot=telemetry_snapshot.get("stats", {}),
+                telemetry_snapshot=telemetry_snapshot,
+                peer_heartbeats=heartbeat_snapshot,
+            )
+            await cluster_state.publish(BALANCER_INSTANCE_ID, payload)
+        except Exception:
+            logger.exception("Failed to publish cluster state")
+        await asyncio.sleep(interval)
+
+
+async def monitor_peer_heartbeats(interval: float = HEALTH_CHECK_INTERVAL):
+    if not BALANCER_PEER_URLS:
+        return
+
+    logger.info("Starting peer heartbeat monitor for %s", ", ".join(BALANCER_PEER_URLS))
+    timeout = aiohttp.ClientTimeout(total=max(1.0, interval))
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            for peer_url in BALANCER_PEER_URLS:
+                heartbeat_url = peer_url.rstrip("/") + "/ha/heartbeat"
+                healthy = False
+                details: dict[str, object] = {"peer_url": peer_url, "checked_at": time.time()}
+                try:
+                    async with session.get(heartbeat_url, timeout=min(1.0, interval)) as response:
+                        healthy = 200 <= response.status < 300
+                        details["status"] = response.status
+                        if healthy:
+                            try:
+                                details["payload"] = await response.json()
+                            except Exception:
+                                details["payload"] = None
+                except Exception as exc:
+                    details["error"] = str(exc)
+
+                details["healthy"] = healthy
+                async with peer_heartbeat_lock:
+                    previous = peer_heartbeats.get(peer_url, {}).get("healthy")
+                    peer_heartbeats[peer_url] = details
+                if previous is not None and bool(previous) != healthy:
+                    logger.info("Peer %s heartbeat changed to %s", peer_url, "healthy" if healthy else "unhealthy")
+
+            await asyncio.sleep(interval)
+
+
 app = FastAPI(title="Smart Load Balancer")
 
 
@@ -194,14 +266,28 @@ async def rate_limit_and_telemetry_middleware(request: Request, call_next):
 async def lifespan(app: FastAPI):
     await state.initialize()
     monitor_task = asyncio.create_task(monitor_loop())
+    publish_task = asyncio.create_task(publish_cluster_state_loop())
+    peer_task = asyncio.create_task(monitor_peer_heartbeats()) if BALANCER_PEER_URLS else None
     try:
         yield
     finally:
         monitor_task.cancel()
+        publish_task.cancel()
+        if peer_task is not None:
+            peer_task.cancel()
         try:
             await monitor_task
         except asyncio.CancelledError:
             logger.info("Monitor task cancelled")
+        try:
+            await publish_task
+        except asyncio.CancelledError:
+            logger.info("Cluster publish task cancelled")
+        if peer_task is not None:
+            try:
+                await peer_task
+            except asyncio.CancelledError:
+                logger.info("Peer monitor task cancelled")
 
 
 app.router.lifespan_context = lifespan
@@ -254,6 +340,31 @@ async def metrics():
 @app.get("/api/metrics")
 async def api_metrics():
     return await telemetry.snapshot(state, rate_limiter)
+
+
+@app.get("/ha/heartbeat")
+async def ha_heartbeat():
+    return {
+        "instance_id": BALANCER_INSTANCE_ID,
+        "instance_url": f"http://{BALANCER_HOST}:{BALANCER_PORT}",
+        "priority": BALANCER_PRIORITY,
+        "heartbeat_at": time.time(),
+        "state_dir": BALANCER_SHARED_STATE_DIR,
+    }
+
+
+@app.get("/ha/status")
+async def ha_status():
+    cluster_snapshot = await cluster_state.snapshot()
+    async with peer_heartbeat_lock:
+        heartbeat_snapshot = dict(peer_heartbeats)
+    return {
+        "instance_id": BALANCER_INSTANCE_ID,
+        "instance_url": f"http://{BALANCER_HOST}:{BALANCER_PORT}",
+        "priority": BALANCER_PRIORITY,
+        "cluster": cluster_snapshot,
+        "peer_heartbeats": heartbeat_snapshot,
+    }
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -337,10 +448,10 @@ async def api_data(request: Request):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy(path: str, request: Request):
-    if path in {"", "health", "stats", "scheduler", "dashboard", "metrics", "api/metrics"}:
+    if path in {"", "health", "stats", "scheduler", "dashboard", "metrics", "api/metrics", "ha/heartbeat", "ha/status"} or path.startswith("ha/"):
         raise HTTPException(status_code=404, detail="Not found")
     return await proxy_to_backend(request, path)
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=BALANCER_HOST, port=BALANCER_PORT)

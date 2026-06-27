@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,4 +12,6 @@ import uvicorn
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    host = os.getenv("BALANCER_HOST", "127.0.0.1")
+    port = int(os.getenv("BALANCER_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)
